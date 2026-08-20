@@ -1,0 +1,330 @@
+#!/bin/sh
+# Measure Codex model tokens/s (thinking + writing), not tool wall-clock.
+# Tools are discouraged by prompt + read-only sandbox. Timer is
+# turn.started → turn.completed (CLI startup excluded). Tokens come from
+# turn.completed.usage, or last token_count.total_token_usage if present.
+#
+# Default model/effort come from ~/.codex/config.toml (currently gpt-5.6-sol / ultra).
+# Uses the ChatGPT.app Codex binary (PATH `codex` is often a cmux shim).
+# Default prompt targets ~2000 output tokens (models may cap earlier).
+# Usage:
+#   codex-speed
+#   codex-speed 3
+#   codex-speed --effort high
+#   codex-speed -m gpt-5.6-sol --effort medium
+#   codex-speed --model gpt-5.6-sol --effort ultra 3
+#   codex-speed --effort low "your prompt"
+# Effort: low | medium | high | xhigh | max | ultra (whatever your model menu has)
+
+set -u
+
+find_codex() {
+  if [ -n "${CODEX_BIN:-}" ] && [ -x "$CODEX_BIN" ]; then
+    printf '%s\n' "$CODEX_BIN"
+    return 0
+  fi
+  for p in \
+    /Applications/ChatGPT.app/Contents/Resources/codex \
+    "$HOME/.codex/plugins/.plugin-appserver/codex"
+  do
+    if [ -x "$p" ]; then
+      printf '%s\n' "$p"
+      return 0
+    fi
+  done
+  c=$(command -v codex 2>/dev/null || true)
+  case $c in
+    ''|*cmux-cli-shims*) return 1 ;;
+  esac
+  [ -x "$c" ] || return 1
+  printf '%s\n' "$c"
+}
+
+CODEX=$(find_codex) || {
+  echo "codex-speed: Codex CLI not found (tried ChatGPT.app and CODEX_BIN)" >&2
+  exit 127
+}
+
+repeats=1
+model=
+effort=
+# ~1500 English words is roughly 2000 tokens; short replies make tok/s noisy.
+prompt='Do not use any tools or shell commands. Write a continuous English technical essay of about 1500 words (target roughly 2000 tokens) on TCP congestion control: slow start, congestion avoidance, fast retransmit, fast recovery, Reno, CUBIC, and BBR. Use numbered sections and concrete examples. Do not stop early. End with a final line that contains only: DONE'
+
+usage() {
+  sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+need_val() {
+  [ "${2:-}" != "" ] || { echo "codex-speed: $1 needs a value" >&2; exit 2; }
+}
+
+while [ "$#" -gt 0 ]; do
+  case $1 in
+    -h|--help) usage; exit 0 ;;
+    -m|--model)
+      need_val "$1" "${2:-}"
+      model=$2
+      shift 2
+      ;;
+    --effort|--reasoning-effort)
+      need_val "$1" "${2:-}"
+      effort=$2
+      shift 2
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -*)
+      echo "codex-speed: unknown flag $1" >&2
+      exit 2
+      ;;
+    *[!0-9]*)
+      prompt=$1
+      shift
+      ;;
+    *)
+      repeats=$1
+      [ "$repeats" -ge 1 ] || { echo "codex-speed: repeats must be >= 1" >&2; exit 2; }
+      shift
+      [ "${1:-}" = "" ] || { prompt=$1; shift; }
+      ;;
+  esac
+done
+
+[ "$#" -eq 0 ] || { echo "codex-speed: extra arguments: $*" >&2; exit 2; }
+
+if [ ! -x "$HOME/.local/bin/clash-port" ]; then
+  echo "codex-speed: ~/.local/bin/clash-port is missing" >&2
+  exit 1
+fi
+CLASH_PORT=$("$HOME/.local/bin/clash-port") || exit 1
+export https_proxy="http://127.0.0.1:${CLASH_PORT}"
+export http_proxy="http://127.0.0.1:${CLASH_PORT}"
+export HTTP_PROXY="$http_proxy"
+export HTTPS_PROXY="$https_proxy"
+export all_proxy="socks5://127.0.0.1:${CLASH_PORT}"
+export ALL_PROXY="$all_proxy"
+
+effort_label=${effort:-ultra (config default)}
+model_label=${model:-gpt-5.6-sol (config default)}
+echo "using model=${model_label}  effort=${effort_label}  proxy=${CLASH_PORT}"
+echo "codex=${CODEX}"
+
+work=$(mktemp -d "${TMPDIR:-/tmp}/codex-speed.XXXXXX") || exit 1
+trap 'rm -rf "$work"' EXIT INT TERM
+
+sum_gen=0
+sum_api=0
+ok=0
+
+i=1
+while [ "$i" -le "$repeats" ]; do
+  out=$work/run-$i.jsonl
+  err=$work/run-$i.err
+  set -- "$CODEX" exec --json --color never --skip-git-repo-check --ephemeral \
+    --sandbox read-only -C "$work" \
+    -c 'approval_policy="never"'
+  [ -n "$model" ] && set -- "$@" --model "$model"
+  [ -n "$effort" ] && set -- "$@" -c "model_reasoning_effort=\"$effort\""
+  set -- "$@" "$prompt"
+
+  vars=$work/run-$i.vars
+  python3 - "$out" "$err" "$vars" -- "$@" <<'PY'
+import json, subprocess, sys, time
+
+def q(s):
+    return "'" + str(s).replace("'", "'\\''") + "'"
+
+def payload(obj):
+    if not isinstance(obj, dict):
+        return {}
+    p = obj.get("payload")
+    return p if isinstance(p, dict) else obj
+
+def event_type(obj):
+    p = payload(obj)
+    return p.get("type") or obj.get("type") or ""
+
+def item_type(obj):
+    p = payload(obj)
+    item = p.get("item") if isinstance(p.get("item"), dict) else {}
+    if not item and isinstance(obj.get("item"), dict):
+        item = obj["item"]
+    return item.get("type") or ""
+
+def write_vars(path, **kw):
+    with open(path, "w", encoding="utf-8") as f:
+        for k, v in kw.items():
+            if isinstance(v, str):
+                f.write(f"{k}={q(v)}\n")
+            else:
+                f.write(f"{k}={v}\n")
+
+TOOL_ITEMS = {
+    "command_execution",
+    "mcp_tool_call",
+    "web_search",
+    "file_change",
+    "custom_tool_call",
+}
+
+argv = sys.argv[1:]
+sep = argv.index("--")
+out_path, err_path, vars_path = argv[0], argv[1], argv[2]
+cmd = argv[sep + 1 :]
+
+turn_ms = []
+open_turn = None
+usage = None
+total_usage = None
+tool_calls = 0
+model = ""
+failed = ""
+
+t0 = time.time()
+with open(out_path, "w", encoding="utf-8") as out, open(
+    err_path, "w", encoding="utf-8"
+) as err:
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=err,
+        text=True,
+        bufsize=1,
+    )
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        out.write(line)
+        raw = line.strip()
+        if not raw.startswith("{"):
+            continue
+        try:
+            obj = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        now = time.time()
+        typ = event_type(obj)
+        p = payload(obj)
+        if typ in ("turn.started", "task_started", "agent.turn.started"):
+            open_turn = now
+        if typ in ("turn.completed", "task_complete", "agent.turn.completed"):
+            if open_turn is not None:
+                turn_ms.append(int(round((now - open_turn) * 1000)))
+                open_turn = None
+            u = p.get("usage") or obj.get("usage")
+            if isinstance(u, dict):
+                usage = u
+        if typ == "turn.failed":
+            err_obj = p.get("error") or obj.get("error") or {}
+            if isinstance(err_obj, dict):
+                failed = str(err_obj.get("message") or "turn.failed")
+            else:
+                failed = "turn.failed"
+        if typ == "token_count":
+            info = p.get("info") or obj.get("info") or {}
+            tot = info.get("total_token_usage")
+            if isinstance(tot, dict):
+                total_usage = tot
+        if typ in ("exec_command", "command_execution", "mcp_tool_call", "web_search"):
+            tool_calls += 1
+        elif typ == "item.completed" and item_type(obj) in TOOL_ITEMS:
+            tool_calls += 1
+        m = p.get("model") or obj.get("model")
+        if not m:
+            ts = p.get("thread_settings") or {}
+            if isinstance(ts, dict):
+                m = ts.get("model")
+        if m:
+            model = m
+    rc = proc.wait()
+t1 = time.time()
+wall_ms = int(round((t1 - t0) * 1000))
+api_ms = sum(turn_ms)
+if api_ms <= 0:
+    api_ms = wall_ms
+
+chosen = total_usage or usage
+if chosen is None or rc != 0:
+    write_vars(
+        vars_path,
+        bad=1,
+        rc=rc,
+        rs=0,
+        out_tok=0,
+        gen=0,
+        api_ms=api_ms,
+        wall_ms=wall_ms,
+        tools=tool_calls,
+        failed=failed,
+        model=model,
+    )
+    raise SystemExit
+
+rs = int(
+    chosen.get("reasoning_output_tokens")
+    or chosen.get("reasoning_tokens")
+    or 0
+)
+out_tok = int(chosen.get("output_tokens") or 0)
+# Codex usually folds reasoning into output_tokens; don't double-count.
+gen = out_tok if out_tok >= rs else out_tok + rs
+
+write_vars(
+    vars_path,
+    bad=0,
+    rc=rc,
+    rs=rs,
+    out_tok=out_tok,
+    gen=gen,
+    api_ms=api_ms,
+    wall_ms=wall_ms,
+    tools=tool_calls,
+    failed=failed,
+    model=model,
+)
+PY
+  bad=1 rc=1 rs=0 out_tok=0 gen=0 api_ms=0 wall_ms=0 tools=0 failed= model=
+  [ -f "$vars" ] && . "$vars"
+
+  if [ "${bad:-1}" -ne 0 ]; then
+    echo "run $i: could not parse Codex JSON (no turn.completed / token_count)" >&2
+    [ -n "${failed:-}" ] && echo "run $i: ${failed}" >&2
+    [ "${rc:-0}" != "0" ] && echo "run $i: exit ${rc}" >&2
+    tail -n 30 "$err" >&2
+    i=$((i + 1))
+    continue
+  fi
+
+  if [ "${tools:-0}" -gt 0 ]; then
+    echo "run $i: warning: Codex still invoked tools (${tools}); tok/s may include that" >&2
+  fi
+
+  if [ "$api_ms" -gt 0 ] && [ "$gen" -gt 0 ]; then
+    api_s=$(python3 -c "print(f'{$api_ms/1000:.2f}')")
+    tps=$(python3 -c "print(f'{$gen / ($api_ms/1000):.1f}')")
+  else
+    api_s="n/a"
+    tps="n/a"
+    echo "run $i: missing turn time or token counts" >&2
+  fi
+  wall_s=$(python3 -c "print(f'{$wall_ms/1000:.2f}')")
+
+  printf 'run %s  model=%s  effort=%s  reasoning=%s  output=%s  api=%ss  think+write=%s tok/s  wall=%ss\n' \
+    "$i" "${model:-$model_label}" "$effort_label" "$rs" "$out_tok" "$api_s" "$tps" "$wall_s"
+
+  if [ "$api_ms" -gt 0 ] && [ "$gen" -gt 0 ]; then
+    sum_gen=$((sum_gen + gen))
+    sum_api=$((sum_api + api_ms))
+    ok=$((ok + 1))
+  fi
+  i=$((i + 1))
+done
+
+if [ "$ok" -ge 2 ]; then
+  avg=$(python3 -c "print(f'{$sum_gen / ($sum_api/1000):.1f}')")
+  printf 'avg over %s runs  think+write=%s tok/s  (output tokens)/turn-time\n' "$ok" "$avg"
+fi
+
+[ "$ok" -ge 1 ] || exit 1

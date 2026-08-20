@@ -1,0 +1,55 @@
+#!/bin/sh
+# Print the current ClashX mixed-port. Prefer ClashX on *:port or
+# 127.0.0.1:port. Do not read Clash Verge yaml. Exit 1 if none is up.
+
+port_ok() {
+  case $1 in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  nc -z -G 1 127.0.0.1 "$1" >/dev/null 2>&1
+}
+
+port=$(lsof -iTCP -sTCP:LISTEN -P -n 2>/dev/null | awk '
+  function port_of(s,    p) {
+    p = s
+    sub(/.*:/, "", p)
+    return p
+  }
+  function skip(p) {
+    return p == "9090" || p == "9091" || p == "9097" || p == "33331"
+  }
+  {
+    addr = $9
+    p = port_of(addr)
+    if (p !~ /^[0-9]+$/ || skip(p)) next
+    is_star = (addr ~ /^\*:/)
+    is_loop = (addr ~ /^127\.0\.0\.1:/)
+    if (!is_star && !is_loop) next
+    if ($1 ~ /ClashX/) {
+      if (is_star) { print "1", p; next }
+      if (p == "7897") { print "2", p; next }
+      if (p == "7890") { print "3", p; next }
+      print "4", p
+      next
+    }
+    if ($1 ~ /[Vv]erge/) next
+    if ($1 ~ /mihomo|[Cc]lash/) {
+      if (is_star) { print "5", p; next }
+      if (p == "7897") { print "6", p; next }
+      if (p == "7890") { print "7", p; next }
+    }
+  }
+' | sort -n | awk 'NR == 1 { print $2; exit }')
+
+if ! port_ok "$port"; then
+  if port_ok 7897; then
+    port=7897
+  elif port_ok 7890; then
+    port=7890
+  else
+    echo "clash-port: ClashX mixed-port is not listening" >&2
+    exit 1
+  fi
+fi
+
+printf '%s\n' "$port"
